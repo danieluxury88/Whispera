@@ -1,4 +1,4 @@
-> **Fork experimental de danieluxury88 — 0.3.0-readaloud.1.** Añade lectura local con voces de Windows, sin clave de Groq. Incluye controles de privacidad para recortes y perfiles nuevos. [Uso, compilación y límites](docs/fork/READ-ALOUD.md). El resto del documento describe el proyecto original; no descargues su instalador esperando obtener esta función.
+> **Fork experimental de danieluxury88 — 0.3.0-readaloud.4.** Añade lectura local con voces de Windows, sin clave de Groq, y un atajo configurable para leer la selección (Ctrl+Alt+R por defecto; repetir para detener). Añade también **Uso de IA**, con cuotas de OpenAI/Codex y un conector reversible de Claude Code ([funcionamiento y límites](docs/fork/AI-USAGE.md)). Incluye controles de privacidad para recortes y perfiles nuevos. [Uso, compilación y límites](docs/fork/READ-ALOUD.md). El resto del documento describe el proyecto original; no descargues su instalador esperando obtener esta función.
 
 <p align="center">
   <img src="apps/desktop/public/cristal/128x128.png" width="80" alt="Whispera" />
@@ -27,13 +27,13 @@ Para pasar desde Whispera-K o una versión anterior de SikJa sin actualizador, i
 | Sistema | Instalador | App comprimida, sin instalador |
 | --- | --- | --- |
 | Windows estable | [Instalador EXE](https://github.com/SikJa/Whispera/releases/latest/download/Whispera-setup.exe) | No incluida |
-| macOS 13+ · Apple Silicon · beta 2 | [DMG](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.2/Whispera_0.3.0-beta.2_aarch64.dmg) | [ZIP con Whispera.app](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.2/Whispera_0.3.0-beta.2_aarch64.app.zip) |
-| macOS 13+ · Intel · beta 2 | [DMG](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.2/Whispera_0.3.0-beta.2_x86_64.dmg) | [ZIP con Whispera.app](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.2/Whispera_0.3.0-beta.2_x86_64.app.zip) |
+| macOS 13+ · Apple Silicon · beta 4 | [DMG](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.4/Whispera_0.3.0-beta.4_aarch64.dmg) | [ZIP con Whispera.app](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.4/Whispera_0.3.0-beta.4_aarch64.app.zip) |
+| macOS 13+ · Intel · beta 4 | [DMG](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.4/Whispera_0.3.0-beta.4_x86_64.dmg) | [ZIP con Whispera.app](https://github.com/SikJa/Whispera/releases/download/v0.3.0-beta.4/Whispera_0.3.0-beta.4_x86_64.app.zip) |
 
-**[Release exclusivo de macOS 0.3.0-beta.2](https://github.com/SikJa/Whispera/releases/tag/v0.3.0-beta.2).**
+**[Release exclusivo de macOS 0.3.0-beta.4](https://github.com/SikJa/Whispera/releases/tag/v0.3.0-beta.4).**
 El ZIP no guarda el perfil junto a la app: usa las mismas ubicaciones de datos y Keychain que el DMG.
 Conserva Cristal, Groq y la interfaz, con integraciones nativas para Mac.
-Consultá [instalación y permisos](docs/MACOS.md) y [las notas de la beta](docs/releases/0.3.0-beta.2.md).
+Consultá [instalación y permisos](docs/MACOS.md) y [las notas de la beta](docs/releases/0.3.0-beta.4.md).
 Probada en runners de macOS, sin validación en una Mac física ni notarización de Apple.
 No reemplaza Windows estable: la beta usa un canal de actualizaciones separado.
 

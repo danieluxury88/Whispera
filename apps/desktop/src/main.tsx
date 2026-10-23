@@ -1,8 +1,10 @@
 import VideoTrim from './VideoTrim';
 import ReaderPanel from './ReaderPanel';
+import AIUsagePanel from './AIUsagePanel';
+import {applyAppTheme,AppThemePicker} from './app-theme';
 import {useUpdates} from "./UpdatesPanel";
 import {listen as listenUpdate} from "@tauri-apps/api/event";
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useLayoutEffect, useState, useRef } from "react";
 import {useAutoSave,AutoSaveStatus} from './useAutoSave';
 import { createRoot } from "react-dom/client";
 import { Dialog, Modal, ModalOverlay } from "react-aria-components";
@@ -35,11 +37,15 @@ import GroqKeyGuide from './GroqKeyGuide';
 import { ShortcutSettings, CaptureHistory } from './CaptureSettings';
 import LibrarySettings from './LibrarySettings';
 import ApplicationSettings from './ApplicationSettings';
+import SettingsSearch from './SettingsSearch';
+import InstalledVersion from './InstalledVersion';
+import type {SettingResult} from './settings-search-index';
 import { credentialStore, isMac } from './platform';
 
 const routes = [
   { id: "transcription", name: "Transcripción", icon: AudioLines, group: "Preferencias" },
   { id: "reading", name: "Lectura", icon: Headphones },
+  { id: "ai-usage", name: "Uso de IA", icon: Activity },
   { id: "appearance", name: "Apariencia", icon: Palette },
   { id: "hotkey", name: "Atajos", icon: Keyboard },
   { id: "screen", name: "Capturas y video", icon: Play },
@@ -54,6 +60,7 @@ const routes = [
 type Route = typeof routes[number]["id"];
 const artworkModels = [{id:'original',name:'Carpeta animada original'},{id:'metallic',name:'Carpeta metálica'}] as const;
 const descriptions: Record<Route, string> = {
+  'ai-usage': "Tus cuotas de OpenAI y Claude, en un lugar.",
   reading: "Escuchá tus textos con las voces locales de Windows.",
   transcription: "Tu voz, con tus preferencias.", dictionary: "Las palabras que tienen que salir bien.",
   appearance: "Tus indicadores, a tu manera.",
@@ -62,15 +69,41 @@ const descriptions: Record<Route, string> = {
   sounds: "Inicio y fin del dictado.",
   screen: "Seleccioná, marcá y pegá. Imagen o video, con tus atajos.",
   library: "Tu historial local de textos, imágenes, videos y archivos.",
-  application: "Cómo se inicia Whispera en tu computadora.",
+  application: "Tu versión de Whispera y sus opciones de inicio.",
 };
 
 function SettingsApp({sidebarExpanded}:{sidebarExpanded:boolean}) {
   const updater=useUpdates();
   const [readerText,setReaderText]=useState("");
+  const [readerNotice,setReaderNotice]=useState("");
+  useEffect(()=>{if(!api.native)return;let alive=true;let off:(()=>void)|undefined;
+    void listenUpdate<string>('reader-shortcut-error',event=>{if(alive){setReaderNotice(event.payload);setRoute('reading');}},{target:'main'}).then(remove=>{if(alive)off=remove;else remove();});
+    return()=>{alive=false;off?.();};
+  },[]);
   const [historyKind,setHistoryKind] = useState<'text'|'captures'>('text');
   const [data, setData] = useState<api.Snapshot>();
+  useLayoutEffect(()=>{if(data)applyAppTheme(data.settings.appTheme,data.settings.appBackground);},[data?.settings.appTheme,data?.settings.appBackground]);
   const [route, setRoute] = useState<Route>("transcription");
+  const [searchTarget,setSearchTarget]=useState<{result:SettingResult;request:number}>();
+  const settingsSection=useRef<HTMLDivElement>(null);
+  useEffect(()=>{
+    if(!searchTarget)return;
+    const section=settingsSection.current;if(!section)return;
+    let marked:HTMLElement|undefined,previousTab:string|null=null;
+    const mark=()=>{
+      const element=searchTarget.result.target?section.querySelector<HTMLElement>(searchTarget.result.target):section.parentElement?.querySelector<HTMLElement>('h1');
+      if(!element||element.closest('[hidden]'))return false;
+      // Focus the containing row, never a shortcut recorder or an action button.
+      marked=element.closest<HTMLElement>('.form-row, .key-line, label')??element;
+      previousTab=marked.getAttribute('tabindex');marked.tabIndex=-1;
+      marked.dataset.searchHighlight='true';marked.focus({preventScroll:true});marked.scrollIntoView({block:'center'});
+      return true;
+    };
+    const observer=new MutationObserver(()=>{if(mark())observer.disconnect();});
+    if(!mark())observer.observe(section,{childList:true,subtree:true,attributes:true,attributeFilter:['hidden']});
+    const timer=setTimeout(()=>{observer.disconnect();if(marked)delete marked.dataset.searchHighlight;},3500);
+    return()=>{observer.disconnect();clearTimeout(timer);if(marked){delete marked.dataset.searchHighlight;if(previousTab===null)marked.removeAttribute('tabindex');else marked.setAttribute('tabindex',previousTab);}};
+  },[searchTarget]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [key, setKey] = useState("");
@@ -104,6 +137,7 @@ function SettingsApp({sidebarExpanded}:{sidebarExpanded:boolean}) {
     return()=>{alive=false;};
   },[route]);
   useEffect(()=>{if(!api.native)return;let alive=true;let off:(()=>void)|undefined;void listenUpdate('updater-open',()=>{if(alive)setRoute('updates');},{target:'main'}).then(remove=>{if(alive)off=remove;else remove();});return()=>{alive=false;off?.();};},[]);
+  useEffect(()=>{if(!api.native)return;let alive=true;let off:(()=>void)|undefined;void listenUpdate('ai-usage-open',()=>{if(alive)setRoute('ai-usage');},{target:'main'}).then(remove=>{if(alive)off=remove;else remove();});return()=>{alive=false;off?.();};},[]);
   const run = async (work: () => Promise<unknown>, success: string) => {
     setBusy(true);
     try { await work(); await refresh(); setMessage(success); return true; }
@@ -124,22 +158,24 @@ function SettingsApp({sidebarExpanded}:{sidebarExpanded:boolean}) {
   const history = data.history.filter(r => r.text.toLowerCase().includes(search.toLowerCase()));
   const title = routes.find(r => r.id === route)!.name;
 
-  return <div className="desktop-app" style={{ "--accent": "#f4b59c" } as React.CSSProperties}>
+  return <div className="desktop-app">
     <SettingsSidebar items={routes} value={route} expanded={sidebarExpanded} count={data.rules.length}
-      onChange={id=>{setRoute(id as Route);setSearch('');setMessage('');}}
+      onChange={id=>{setSearchTarget(undefined);setRoute(id as Route);setSearch('');setMessage('');}}
       brand={<a className="desktop-brand" href="?view=settings"><span className="brand-mark"><img src="/cristal/64x64.png" alt="" /></span><span className="brand-copy"><strong>Whispera</strong><small>Voz, capturas y video</small></span></a>}
       update={(updater.status.version||updater.status.upstream?.phase==='available')&&<button className="sidebar-update" aria-label={updater.status.version?'Actualización disponible':'Novedades de Whispera-K'} onClick={()=>setRoute('updates')}><Download size={16}/><span><strong>{updater.status.version?'Actualización disponible':'Novedades de Whispera-K'}</strong><small>{updater.status.version?`Whispera ${updater.status.version}`:`K ${updater.status.upstream?.version}`}</small></span><ArrowUpRight size={14}/></button>}
       footer={<div className="sidebar-bottom"><a className="recorder-link" href="?view=record" aria-label="Abrir o cerrar grabadora" aria-disabled={busy} onClick={e=>{if(api.native){e.preventDefault();if(!busy)void run(()=>invoke('toggle_recorder'),'');}}}><AudioLines size={18} /><span>Abrir grabadora</span><ArrowUpRight size={15} /></a></div>} />
     <div className="desktop-main" role="region" aria-label="Contenido de configuración" tabIndex={0}>
       <section className="desktop-content">
+        <SettingsSearch onNavigate={result=>{setRoute(result.route);setSearch('');setMessage('');setSearchTarget({result,request:Date.now()});}}/>
         <div className="page-heading"><div><h1>{title}</h1><p>{descriptions[route]}</p></div><AutoSaveStatus save={autosave}/></div>
         {message && <div className="notice" role="status">{message}<button aria-label="Cerrar aviso" onClick={() => setMessage("")}><X size={14} /></button></div>}
-        <div className="settings-section">
-        {route==='reading'&&<ReaderPanel text={readerText} onTextChange={setReaderText}/>}
-        {route==='updates'&&<p role="status">Versión experimental de danieluxury88. Las actualizaciones del proyecto original están desactivadas para conservar la lectura local.</p>}
-        {route==='application'&&<ApplicationSettings/>}
+        <div className="settings-section" ref={settingsSection}>
+        {route==='ai-usage'&&<AIUsagePanel/>}
+        {route==='reading'&&<>{readerNotice&&<p role="alert">{readerNotice} <button onClick={()=>setReaderNotice('')}>Cerrar aviso</button></p>}<ReaderPanel text={readerText} onTextChange={setReaderText}/></>}
+        {route==='updates'&&<><InstalledVersion version={updater.status.currentVersion}/><p className="fork-update-info" role="status">Versión experimental de danieluxury88. Las actualizaciones son manuales para conservar las funciones de esta versión.</p></>}
+        {route==='application'&&<><InstalledVersion version={updater.status.currentVersion}/><ApplicationSettings/></>}
         {route === 'screen' && <ScreenRecorder />}
-        {route === 'library' && <LibrarySettings />}
+        {route === 'library' && <LibrarySettings settingsRequest={searchTarget?.result.librarySettings?searchTarget.request:undefined}/>}
         {route==='sounds'&&<SoundSettings settings={data.settings} patch={patch} onError={setMessage}/>}
         {route==='diagnostics'&&<><div className="form-row"><label htmlFor="watchdog">Recuperar interfaz sin respuesta</label><SettingsSwitch id="watchdog" label="Vigilancia de interfaz" checked={data.settings.watchdog} onChange={v=>patch({watchdog:v})}/></div><button disabled={!api.native||busy} onClick={()=>run(()=>invoke('restart_app'),'Reiniciando')}><RotateCcw size={16}/>Reiniciar Whispera</button></>}
         {route === "transcription" && <>
@@ -168,6 +204,7 @@ function SettingsApp({sidebarExpanded}:{sidebarExpanded:boolean}) {
         </>}
 
         {route === "appearance" && <>
+          <AppThemePicker value={data.settings.appTheme} background={data.settings.appBackground} onChange={appTheme=>patch({appTheme,appBackground:''})} onBackgroundChange={appBackground=>patch({appBackground})}/>
           <div className="artwork-picker" role="group" aria-label="Modelo de carpeta"><button className="artwork-arrow" aria-label="Modelo anterior" onClick={()=>changeArtwork(-1)}><ChevronLeft size={22}/></button><div className="appearance-preview">{data.settings.dictationArtwork==='metallic'?<IndicatorArtwork kind="folder" original={data.settings.metallicOriginal??true} color={data.settings.metallicColor??'#ffffff'}/>:<ControlledFolder color="black" customColor={data.settings.color} size="sm" visualState="rest" />}</div><button className="artwork-arrow" aria-label="Modelo siguiente" onClick={()=>changeArtwork(1)}><ChevronRight size={22}/></button></div><div className="artwork-model-name" aria-live="polite">{artworkModels[artworkIndex].name}<small>{artworkIndex+1} / {artworkModels.length}</small></div>
           <h3>Color de carpeta</h3><div className="form-row"><label>Color de carpeta<span>{data.settings.dictationArtwork==='metallic'?'Tinte metálico · conserva sombras y reflejos':'Superficie, bordes e iconos'}</span></label><PalettePanel value={{ base: "black", hex: appearanceColor }} onChange={value => patch(data.settings.dictationArtwork==='metallic'?{metallicColor:selectionHex(value),metallicOriginal:false}:{color:selectionHex(value)})} /></div>{data.settings.dictationArtwork==='metallic'&&<button className="text-link" onClick={()=>patch({metallicColor:'#ffffff',metallicOriginal:true})}>Restaurar color original</button>}<div className="color-values"><span style={{ background: appearanceColor }} /><code>{appearanceColor.toUpperCase()}</code></div>
             <h3>Carpeta de transcripción</h3><div className="form-row"><label htmlFor="pattern">Movimiento de los papeles</label><select id="pattern" disabled={data.settings.dictationArtwork==='metallic'} value={data.settings.pattern} onChange={e => patch({ pattern: e.target.value as api.Settings["pattern"] })}><option value="wave">Ola</option><option value="stairs">Escalera</option></select></div>
@@ -198,6 +235,10 @@ function SettingsRoot(){
   return <div className="settings-window"><WindowChrome onError={setWindowError} sidebarExpanded={sidebarExpanded} onToggleSidebar={toggleSidebar}/>{windowError&&<p role="alert" className="window-control-error">{windowError}</p>}<SetupGate><SettingsApp sidebarExpanded={sidebarExpanded}/></SetupGate></div>;
 }
 const view=new URLSearchParams(location.search).get("view");
+if(!view||['settings','import'].includes(view)) {
+  try{applyAppTheme(localStorage.getItem('whispera.app.theme')??'plum',localStorage.getItem('whispera.app.background')??'');}catch{applyAppTheme('plum');}
+  if(view==='import')void api.readSettings().then(s=>applyAppTheme(s.appTheme,s.appBackground)).catch(()=>{});
+}
 if(!view||view==='settings')document.documentElement.dataset.settingsShell='true';
 if (view?.startsWith('screen-')) document.documentElement.dataset.screenSelect = 'true';
 if (view === "record") document.documentElement.dataset.floating = "true";
