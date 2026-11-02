@@ -2,6 +2,10 @@
 
 - Rare UI folder: Swami Malode, MIT. Original license: `apps/desktop/vendor/LICENSE`.
   https://github.com/swamimalode07/rare-ui . Preserved source and adapted ControlledFolder.
+- Grid Reveal: Swami Malode / [Rare UI](https://www.rareui.com/components/gridreveal),
+  MIT + Commons Clause + Attribution (2026). Used inside Whispera, not as a component library.
+  Source and full license retained in `apps/desktop/vendor/edge-drop/src/components/grid-reveal.tsx`
+  and `grid-reveal.LICENSE`. Local changes adapt styling and pause hidden animations.
 - Handy Pop and Marimba sounds: CJ Pais (2025), MIT. Full license distributed alongside sound files:
   `apps/desktop/public/sound-lab/HANDY-LICENSE.txt`. Sources and pinned revision in `SOURCES.md` there.
 - Instrument Sans: SIL Open Font License 1.1, distributed by @fontsource-variable/instrument-sans.
@@ -13,6 +17,17 @@
 
 Before public release, review the complete dependency license inventory, including transitive packages.
 This notice is attribution, not a claim that a complete legal audit has been performed.
+# Local reading language detection
+
+whatlang 0.18.0: Sergey Potapov and upstream contributors, MIT.
+Source: https://github.com/greyblake/whatlang-rs . Full notice:
+`docs/licenses/whatlang.txt`, bundled as `licenses/whatlang.txt`.
+Its newly enabled allocator-api2 0.2.21 dependency is used under MIT;
+the notice is retained in `docs/licenses/allocator-api2.txt` and bundled
+as `licenses/allocator-api2.txt`. Existing hashbrown/foldhash/equivalent
+dependencies retain their upstream licenses. No language models are downloaded
+at runtime; the detector and profiles compile into the desktop binary.
+
 # Screen recording
 
 ## Clipboard library

@@ -219,6 +219,7 @@ export function useEdgeHover(): void {
     const closePanelNow = () => {
       const s = useStore.getState()
       if (s.dragActive || s.internalDragReq) return
+      if (s.nativeDialogOpen || s.settingsOpen || document.querySelector('.palette-popover')) return
       if (s.styleFlyoutOpen) s.setStyleFlyoutOpen(false)
       if (s.languageFlyoutOpen) s.setLanguageFlyoutOpen(false)
       s.setOpen(false)
@@ -233,6 +234,7 @@ export function useEdgeHover(): void {
       graceTimer = undefined
       const state = useStore.getState()
       if (!state.open) return
+      if (state.nativeDialogOpen || state.settingsOpen || document.querySelector('.palette-popover')) return
       if (state.sliderActive || state.edgeTransition?.active) return
       if (state.dragActive || state.internalDragReq) return
 
@@ -405,7 +407,7 @@ export function useEdgeHover(): void {
     }
 
     const onPanelLeave = () => {
-      if (isInsideBlade()) {
+      if (isInsideBlade() || stickyPanel) {
         cancelClose()
         return
       }
@@ -440,8 +442,28 @@ export function useEdgeHover(): void {
     // The main process polls screen.getCursorScreenPoint() every 16ms and
     // sends window:cursor-edge with raw x/y coords. We check the hot zone
     // here with the renderer's own settings so everything stays in sync.
+    // Whispera: once open, the panel stays until a click outside it (or Esc).
+    // Leaving with the pointer, dragging an item out to another app or losing
+    // focus no longer closes it. A press that began inside (a drag) never counts.
+    let wasDown = false
+    let stickyPanel = false
+    // The click that opened the panel (tray menu, a button) must not count as
+    // the click outside that closes it, so presses only count once it settled.
+    let openedAt = 0
+    let wasOpen = false
     const unsubCursorEdge = window.edge.onCursorEdge((data) => {
       lastClient.current = { x: data.x, y: data.y }
+      const sticky = typeof data.down === "boolean"
+      stickyPanel = sticky
+      const isOpen = useStore.getState().open
+      if (isOpen && !wasOpen) openedAt = Date.now()
+      wasOpen = isOpen
+      const freshPress = sticky && !wasDown && (data.down || !!data.clicked) && Date.now() - openedAt > 400
+      wasDown = !!data.down
+      const leave = (delay?: number) => {
+        if (!sticky) scheduleClose(delay)
+        else if (freshPress) scheduleClose(0)
+      }
       if (data.displayWidth) displaySize.current.width = data.displayWidth
       if (data.displayHeight) displaySize.current.height = data.displayHeight
       const state = useStore.getState()
@@ -519,7 +541,7 @@ export function useEdgeHover(): void {
           }
 
           if (distFromTop > startCloseDepth || distFromTop < -BUFFER_PX || outsideX) {
-            scheduleClose()
+            leave()
           }
           break
         }
@@ -581,7 +603,7 @@ export function useEdgeHover(): void {
           }
 
           if (distFromRight > currentStartClosePx || distFromRight < -BUFFER_PX || !insideY) {
-            scheduleClose()
+            leave()
           }
           break
         }
@@ -643,7 +665,7 @@ export function useEdgeHover(): void {
           }
 
           if (data.x > currentStartClosePx || data.x < -BUFFER_PX || !insideY) {
-            scheduleClose()
+            leave()
           }
         }
       }
@@ -675,7 +697,7 @@ export function useEdgeHover(): void {
       if (!state.open) return
       // Don't close during an external OS file drag — the drag surface may
       // temporarily shift focus to the OS drag-ghost or file manager.
-      if (state.dragActive || state.internalDragReq) return
+      if (state.dragActive || state.internalDragReq || stickyPanel) return
       scheduleClose(400)
     }
 
@@ -696,7 +718,7 @@ export function useEdgeHover(): void {
     const onDocDragLeave = (e: DragEvent) => {
       if (!e.relatedTarget) {
         useStore.getState().setDragActive(false)
-        if (useStore.getState().internalDragReq) scheduleClose(0)
+        if (useStore.getState().internalDragReq && !stickyPanel) scheduleClose(0)
       }
     }
     const onDocDrop = (e: DragEvent) => {

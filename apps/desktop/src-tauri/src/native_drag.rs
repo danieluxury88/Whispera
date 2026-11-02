@@ -23,6 +23,22 @@ pub fn reserve() -> Result<Permit, String> {
 }
 #[cfg(windows)]
 pub fn button_down() -> bool { unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 } }
+#[cfg(windows)]
+pub fn release_source_capture(window:&tauri::WebviewWindow)->Result<(),String> {
+    let source=window.clone();let (send,receive)=std::sync::mpsc::channel();
+    window.run_on_main_thread(move||{
+        use windows::Win32::UI::{Input::KeyboardAndMouse::{GetCapture,ReleaseCapture},WindowsAndMessaging::IsChild};
+        let result=(||{
+            let owner=HWND(source.hwnd().map_err(|e|e.to_string())?.0);
+            let capture=unsafe{GetCapture()};
+            if capture==owner||unsafe{IsChild(owner,capture).as_bool()} {
+                unsafe{ReleaseCapture()}.map_err(|e|e.to_string())?;
+            }
+            Ok(())
+        })();let _=send.send(result);
+    }).map_err(|e|e.to_string())?;
+    receive.recv_timeout(Duration::from_secs(5)).map_err(|_|"No respondió el inicio del arrastre".to_string())?
+}
 #[cfg(target_os = "macos")]
 pub fn button_down() -> bool {
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -117,7 +133,18 @@ fn helper() -> Result<(), String> {
     let instance = unsafe { GetModuleHandleW(None) }.map_err(|e| e.to_string())?;
     let class = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: HINSTANCE(instance.0), lpszClassName: w!("WhisperaFileDrag"), ..Default::default() };
     unsafe { RegisterClassW(&class); }
-    let window = Window(unsafe { CreateWindowExW(WS_EX_TOOLWINDOW, w!("WhisperaFileDrag"), w!("Whispera · Arrastre"), WS_POPUP, 0, 0, 1, 1, None, None, Some(HINSTANCE(instance.0)), None) }.map_err(|e| e.to_string())?);
+    let source=HWND(request.source as usize as *mut _);
+    // DoDragDrop consumes the calling thread's input queue. A fresh hidden
+    // helper has never received the source's button-down and otherwise may
+    // never receive its release. Share that input queue only for this gesture.
+    use windows::Win32::{System::Threading::{GetCurrentThreadId,AttachThreadInput},UI::WindowsAndMessaging::GetWindowThreadProcessId};
+    struct InputQueue(u32,u32);
+    impl Drop for InputQueue {fn drop(&mut self){unsafe{let _=AttachThreadInput(self.0,self.1,false);}}}
+    let thread=unsafe{GetCurrentThreadId()};
+    let source_thread=unsafe{GetWindowThreadProcessId(source,None)};
+    let window = Window(unsafe { CreateWindowExW(WS_EX_TOOLWINDOW, w!("WhisperaFileDrag"), w!("Whispera · Arrastre"), WS_POPUP, 0, 0, 1, 1, Some(source), None, Some(HINSTANCE(instance.0)), None) }.map_err(|e| e.to_string())?);
+    if source_thread==0||!unsafe{AttachThreadInput(thread,source_thread,true)}.as_bool(){return Err("No se pudo conectar el arrastre a la ventana de origen".into());}
+    let _input=InputQueue(thread,source_thread);
     if !button_down() { return Ok(()); }
     drag::start_drag(&window, drag::DragItem::Files(request.files), drag::Image::Raw(request.preview), |_, _| {}, Default::default()).map_err(|e| e.to_string())
 }

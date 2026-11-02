@@ -21,9 +21,16 @@ pub struct Settings {
     pub dictation_artwork: String,
     pub metallic_color: String,
     pub metallic_original: bool,
+    pub app_theme: String,
+    pub app_background: String,
     pub trim_silence: bool,
     pub watchdog: bool,
     pub incremental_transcription: bool,
+    /// Input device name; empty uses the system default microphone.
+    pub microphone: String,
+    /// "groq" (cloud) or "local" (on-device model).
+    pub transcription_engine: String,
+    pub local_model: String,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -42,14 +49,23 @@ impl Default for Settings {
             dictation_artwork: "original".into(),
             metallic_color: "#ffffff".into(),
             metallic_original: true,
+            app_theme: "plum".into(),
+            app_background: String::new(),
             trim_silence: true,
             watchdog: true,
             incremental_transcription: true,
+            microphone: String::new(),
+            transcription_engine: "groq".into(),
+            local_model: "parakeet-v3".into(),
         }
     }
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.app_background.is_empty() && (self.app_background.len()!=7 || !self.app_background.starts_with('#') || !self.app_background[1..].bytes().all(|b|b.is_ascii_hexdigit())) {return Err("Color de fondo inválido".into());}
+        if !["plum","graphite","navy","forest","slate","sand"].contains(&self.app_theme.as_str()) {
+            return Err("Tema de aplicación no admitido".into());
+        }
         if !["original", "metallic"].contains(&self.dictation_artwork.as_str()) {
             return Err("Indicador de dictado no admitido".into());
         }
@@ -69,6 +85,9 @@ impl Settings {
         if !["whisper-large-v3-turbo", "whisper-large-v3"].contains(&self.model.as_str()) {
             return Err("Modelo no admitido".into());
         }
+        if !["groq", "local"].contains(&self.transcription_engine.as_str()) || crate::local_asr::spec(&self.local_model).is_none() {
+            return Err("Motor de transcripción no admitido".into());
+        }
         if !["es", "en", "pt", "auto"].contains(&self.language.as_str()) {
             return Err("Idioma no admitido".into());
         }
@@ -82,6 +101,9 @@ impl Settings {
             || !["left", "right", "top", "bottom"].contains(&self.placement.as_str())
         {
             return Err("Apariencia no admitida".into());
+        }
+        if self.microphone.len() > 300 {
+            return Err("Micrófono no válido".into());
         }
         if self.hotkey.trim().is_empty() || self.hotkey.len() > 80 {
             return Err("Atajo invalido".into());
@@ -169,7 +191,19 @@ impl Store {
             CREATE TABLE IF NOT EXISTS history(id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, text TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS imports(path TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, message TEXT NOT NULL);").map_err(|e| e.to_string())?;
-        Ok(Self(Mutex::new(conn)))
+        let store = Self(Mutex::new(conn));
+        store.prune_events()?;
+        Ok(store)
+    }
+    // Only the latest 100 events are shown; without a bound the diagnostic log
+    // grows for as long as the profile exists.
+    pub fn prune_events(&self) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "Base de datos ocupada")?
+            .execute("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - 2000", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
     pub fn get<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> Result<T, String> {
         let conn = self.0.lock().map_err(|_| "Base de datos ocupada")?;
@@ -315,8 +349,32 @@ mod tests {
         assert!(store.update_transcript("first", " ").is_err());
     }
     #[test]
+    fn diagnostic_events_stay_bounded_and_keep_the_latest() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for i in 0..2500 { store.event(&format!("evento {i}")).unwrap(); }
+        store.prune_events().unwrap();
+        let count: i64 = store.0.lock().unwrap().query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2000);
+        assert!(store.logs().unwrap()[0].ends_with("evento 2499"));
+    }
+    #[test]
     fn defaults_valid() {
         assert!(Settings::default().validate().is_ok());
+    }
+    #[test]
+    fn app_themes_validate_migrate_and_persist_without_resetting_preferences() {
+        let old:Settings=serde_json::from_str(r##"{"color":"#123456","autoPaste":false}"##).unwrap();
+        assert_eq!(old.app_theme,"plum");
+        assert_eq!(old.app_background,"");
+        let store=Store::open(Path::new(":memory:")).unwrap();
+        for theme in ["plum","graphite","navy","forest","slate","sand"] {
+            let mut settings=old.clone();settings.app_theme=theme.into();settings.app_background="#708090".into();settings.validate().unwrap();
+            store.put("settings",&settings).unwrap();let saved:Settings=store.get("settings").unwrap();
+            assert_eq!(saved.app_theme,theme);assert_eq!(saved.color,"#123456");assert!(!saved.auto_paste);
+            assert_eq!(saved.app_background,"#708090");
+        }
+        let mut bad=old.clone();bad.app_theme="#ff00ff".into();assert!(bad.validate().is_err());
+        for color in ["red","#fff","#gggggg","url(test)","#000000;"] {let mut bad=old.clone();bad.app_background=color.into();assert!(bad.validate().is_err());}
     }
     #[test]
     fn malformed_color_rejected() {

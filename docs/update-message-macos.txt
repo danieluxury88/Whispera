@@ -1,1 +1,1 @@
-Beta 2 para Mac: recuperacion de capturas, cierre seguro de paneles y mejoras del portapapeles. DMG y ZIP para Apple Silicon e Intel, con pruebas de extraccion y arranque. Sin notarizacion de Apple; falta validar dispositivos en una Mac real.
+Ahora podés mover, contraer y cambiar el tamaño de las barras de captura. Mejoramos la protección contra cierres de texto inventados al terminar un dictado. Conserva tus preferencias y las mejoras anteriores. Disponible para Apple Silicon e Intel.

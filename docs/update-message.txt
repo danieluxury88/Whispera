@@ -1,1 +1,1 @@
-Corregimos capturas y videos bloqueados, paneles invisibles que interceptaban clics y el cierre del portapapeles. Mejoramos el arrastre, la apertura de herramientas y los atajos segun el teclado. Conservamos tu diccionario y configuracion.
+Capturas más fluidas y copia con Ctrl+C optimizada. Menor consumo en reposo, mejoras en biblioteca y transcripción incremental, y ajustes para evitar «gracias» provocado por ruido constante durante el silencio.

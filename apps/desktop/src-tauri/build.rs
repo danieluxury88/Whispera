@@ -1,9 +1,36 @@
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") { build_windows_reader(); }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") { build_windows_reader(); build_windows_usage(); }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         build_macos_bridge();
     }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        link_vulkan();
+    }
     tauri_build::build()
+}
+
+fn build_windows_usage() {
+    use std::{env,path::PathBuf,process::Command};
+    let root=PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let source=root.join("native").join("ClaudeUsage.cs");
+    println!("cargo:rerun-if-changed={}",source.display());
+    let out=root.join("target").join("reader");std::fs::create_dir_all(&out).unwrap();
+    let compiler=PathBuf::from(env::var_os("WINDIR").unwrap()).join("Microsoft.NET").join("Framework64").join("v4.0.30319").join("csc.exe");
+    let result=Command::new(compiler).args(["/nologo","/target:exe","/optimize+","/reference:System.Web.Extensions.dll"])
+        .arg(format!("/out:{}",out.join("WhisperaClaudeUsage.exe").display())).arg(source).output().expect("Windows .NET Framework compiler required");
+    assert!(result.status.success(),"Claude usage bridge did not compile: {}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+}
+
+// The local transcription engine links the Vulkan loader from the SDK. It is
+// delay-loaded so Whispera still starts on a PC whose video driver has no
+// vulkan-1.dll; local_asr checks for it before touching the engine.
+fn link_vulkan() {
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    if let Ok(sdk) = std::env::var("VULKAN_SDK") {
+        println!("cargo:rustc-link-search=native={sdk}\\Lib");
+    }
+    println!("cargo:rustc-link-arg=/DELAYLOAD:vulkan-1.dll");
+    println!("cargo:rustc-link-lib=delayimp");
 }
 
 fn build_macos_bridge() {

@@ -44,6 +44,7 @@ struct Cached {
 
 pub struct Live {
     pub stop: Arc<AtomicBool>,
+    pub wake: Arc<tokio::sync::Notify>,
     pub done: Arc<AtomicBool>,
     pub task: tauri::async_runtime::JoinHandle<Result<(), String>>,
 }
@@ -106,20 +107,23 @@ fn window(index: u64, samples: u64, rate: u32, finalizing: bool) -> Option<Windo
     })
 }
 
-fn info(dir: &Path) -> Result<(u64, u32), String> {
+fn sample_rate(dir: &Path) -> Result<u32, String> {
     let m: audio::Manifest =
         serde_json::from_slice(&fs::read(dir.join("session.json")).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     if m.sample_rate == 0 || m.sample_rate > 192_000 {
         return Err("Frecuencia de audio no admitida".into());
     }
-    Ok((
-        fs::metadata(dir.join("audio.pcm"))
-            .map_err(|e| e.to_string())?
-            .len()
-            / 2,
-        m.sample_rate,
-    ))
+    Ok(m.sample_rate)
+}
+
+fn sample_count(dir: &Path) -> Result<u64, String> {
+    Ok(fs::metadata(dir.join("audio.pcm")).map_err(|e| e.to_string())?.len() / 2)
+}
+
+fn info(dir: &Path) -> Result<(u64, u32), String> {
+    let rate = sample_rate(dir)?;
+    Ok((sample_count(dir)?, rate))
 }
 
 fn wav(dir: &Path, index: u64, w: &Window, rate: u32) -> Result<PathBuf, String> {
@@ -156,8 +160,20 @@ fn owned_text(json: &serde_json::Value, w: &Window, rate: u32) -> Result<String,
         .get("words")
         .and_then(|v| v.as_array())
         .ok_or("Groq no devolvio tiempos de palabras; reintenta el audio guardado")?;
+    // Word timestamps carry no punctuation; the segment text does. When both
+    // tokenize to the same words, keep the punctuated spelling of each word.
+    let segment_text: String = json
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .map(|segments| segments.iter().filter_map(|s| s["text"].as_str()).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let punctuated: Vec<&str> = segment_text.split_whitespace().collect();
+    let aligned = punctuated.len() == words.len()
+        && punctuated.iter().zip(words).all(|(token, word)| {
+            groq::letters(token) == groq::letters(word["word"].as_str().unwrap_or(""))
+        });
     let mut owned = vec![];
-    for word in words {
+    for (index, word) in words.iter().enumerate() {
         let start = word["start"].as_f64().ok_or("Tiempo de palabra invalido")?;
         let end = word["end"].as_f64().ok_or("Tiempo de palabra invalido")?;
         if !start.is_finite() || !end.is_finite() || start < 0. || end < start {
@@ -165,7 +181,8 @@ fn owned_text(json: &serde_json::Value, w: &Window, rate: u32) -> Result<String,
         }
         let midpoint = w.from as f64 + (start + end) * 0.5 * f64::from(rate);
         if midpoint >= w.start as f64 && midpoint < w.end as f64 {
-            owned.push(word["word"].as_str().ok_or("Palabra invalida")?.trim());
+            let plain = word["word"].as_str().ok_or("Palabra invalida")?.trim();
+            owned.push(if aligned { punctuated[index] } else { plain });
         }
     }
     if words.is_empty() && json["text"].as_str().is_some_and(|s| !s.trim().is_empty()) {
@@ -181,6 +198,7 @@ async fn part(
     rate: u32,
     p: &Plan,
     stop: &AtomicBool,
+    wake: &tokio::sync::Notify,
 ) -> Result<String, String> {
     let cache = dir.join(format!("live-{index:04}.json"));
     if cache.exists() {
@@ -200,11 +218,12 @@ async fn part(
         .map_err(|e| e.to_string())??;
     let began = Instant::now();
     let mut last = String::new();
+    let mut upload = groq::Upload::new(&path);
     for attempt in 0..3 {
         if stop.load(Ordering::SeqCst) {
             return Err("Envio anticipado detenido".into());
         }
-        match groq::request(&path, &p.settings, &p.rules, true).await {
+        match upload.request(&p.settings, &p.rules, true).await {
             Ok(json) => {
                 let text = owned_text(&json, &w, rate).map_err(|e| format!("Alineacion: {e}"))?;
                 atomic_json(
@@ -226,26 +245,38 @@ async fn part(
                 if !retry || attempt == 2 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
+                if wait_or_stop(stop,wake,Duration::from_secs(2 << attempt)).await { break; }
             }
         }
     }
     Err(last)
 }
 
+async fn wait_or_stop(stop:&AtomicBool,wake:&tokio::sync::Notify,duration:Duration)->bool {
+    if stop.load(Ordering::SeqCst) {return true;}
+    tokio::select! { _=wake.notified()=>{}, _=tokio::time::sleep(duration)=>{} }
+    stop.load(Ordering::SeqCst)
+}
+#[cfg(test)]
 pub async fn run(dir: PathBuf, stop: Arc<AtomicBool>) -> Result<(), String> {
+    run_notified(dir,stop,Arc::new(tokio::sync::Notify::new())).await
+}
+pub async fn run_notified(dir: PathBuf, stop: Arc<AtomicBool>, wake:Arc<tokio::sync::Notify>) -> Result<(), String> {
     let p = plan(&dir)?;
+    if stop.load(Ordering::SeqCst) { return Ok(()); }
+    // Format metadata is immutable for this worker; only the durable PCM grows.
+    let rate = sample_rate(&dir)?;
     let mut index = 0;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let (samples, rate) = info(&dir)?;
+        let samples = sample_count(&dir)?;
         if let Some(w) = window(index, samples, rate, false) {
-            part(&dir, index, w, rate, &p, &stop).await?;
+            part(&dir, index, w, rate, &p, &stop,&wake).await?;
             index += 1;
         } else {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            wait_or_stop(&stop,&wake,Duration::from_millis(200)).await;
         }
     }
 }
@@ -340,12 +371,15 @@ async fn original(dir: &Path, p: &Plan) -> Result<String, String> {
                 if trim {
                     audio::trimmed_copy(&file)
                 } else {
-                    Ok(file)
+                    Ok(Some(file))
                 }
             })
             .await
             .map_err(|e| e.to_string())??;
-            let text = groq::transcribe_raw(&prepared, &p.settings, &p.rules).await?;
+            let text = match prepared {
+                Some(prepared) => groq::transcribe_raw(&prepared, &p.settings, &p.rules).await?,
+                None => String::new(),
+            };
             atomic_json(&cache, &text)?;
             text
         };
@@ -362,9 +396,10 @@ async fn finish_parts(dir: &Path, p: &Plan) -> Result<String, String> {
     let mut texts = vec![];
     let mut index = 0;
     let stop = AtomicBool::new(false);
+    let wake = tokio::sync::Notify::new();
     let mut previous = None;
     while let Some(w) = window(index, samples, rate, true) {
-        texts.push(part(dir, index, w, rate, &p, &stop).await?);
+        texts.push(part(dir, index, w, rate, &p, &stop,&wake).await?);
         if p.version >= 2 {
             let c: Cached = serde_json::from_slice(
                 &fs::read(dir.join(format!("live-{index:04}.json"))).map_err(|e| e.to_string())?,
@@ -383,6 +418,123 @@ async fn finish_parts(dir: &Path, p: &Plan) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn performance_live_session_metadata_is_loaded_once() {
+        let dir = std::env::temp_dir().join(format!("whispera-metadata-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        prepare(&dir, Settings::default(), vec![]).unwrap();
+        let manifest = br#"{"id":"synthetic","sample_rate":48000,"created_at":"synthetic"}"#;
+        fs::write(dir.join("session.json"), manifest).unwrap();
+        fs::write(dir.join("audio.pcm"), [0u8; 2]).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let kept_running = tauri::async_runtime::block_on(async {
+            let work = run_notified(dir.clone(), stop.clone(), wake.clone());
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                result = &mut work => panic!("Worker finished before setup: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            // The session format is immutable; only audio.pcm grows while active.
+            fs::remove_file(dir.join("session.json")).unwrap();
+            wake.notify_one();
+            let pending = tokio::time::timeout(Duration::from_millis(250), &mut work).await.is_err();
+            stop.store(true, Ordering::SeqCst);
+            wake.notify_one();
+            if pending { work.await.unwrap(); }
+            pending
+        });
+        fs::remove_dir_all(dir).unwrap();
+        assert!(kept_running, "The live worker reread immutable metadata during polling");
+    }
+    #[test]
+    #[ignore = "Synthetic-only real Groq boundary regression; no microphone, personal recordings or clipboard"]
+    fn synthetic_spoken_thanks_crossing_minute_is_preserved_once() {
+        let fixtures=PathBuf::from(std::env::var_os("WHISPERA_THANKS_FIXTURES").expect("Synthetic fixtures"));
+        let manifest:serde_json::Value=serde_json::from_slice(&fs::read(fixtures.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["syntheticOnly"],true);
+        crate::upload_tail::BENCHMARK_BYPASS.store(std::env::var("WHISPERA_THANKS_BASELINE").as_deref()==Ok("1"),Ordering::SeqCst);
+        crate::lossless_upload::configure(Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows){"../node_modules/ffmpeg-static/ffmpeg.exe"}else{"../node_modules/ffmpeg-static/ffmpeg"}));
+        let mut report=vec![];
+        for file in ["boundary65.wav","boundary65-quiet.wav"] {
+            let mut wave=hound::WavReader::open(fixtures.join(file)).unwrap();let rate=wave.spec().sample_rate;
+            assert_eq!(wave.spec().channels,1);assert_eq!(wave.spec().bits_per_sample,16);
+            let pcm:Vec<u8>=wave.samples::<i16>().map(Result::unwrap).flat_map(i16::to_le_bytes).collect();
+            assert_eq!(pcm.len() as u64,65*u64::from(rate)*2);
+            let root=std::env::temp_dir().join(format!("whispera-boundary-{}",uuid::Uuid::new_v4()));fs::create_dir(&root).unwrap();
+            atomic_json(&root.join("session.json"),&audio::Manifest{id:"synthetic".into(),sample_rate:rate,created_at:"synthetic".into()}).unwrap();
+            fs::write(root.join("audio.pcm"),&pcm).unwrap();prepare(&root,Settings::default(),vec![]).unwrap();
+            let text=tauri::async_runtime::block_on(finish(&root)).unwrap();
+            report.push(serde_json::json!({"file":file,"text":text,"fallback":root.join("full-audio-fallback.json").exists()}));
+            fs::write(std::env::var_os("WHISPERA_BOUNDARY_RESULTS").expect("Results"),serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            let thanks=text.split_whitespace().filter(|word|word.chars().filter(|c|c.is_alphanumeric()).collect::<String>().to_lowercase()=="gracias").count();
+            assert_eq!(thanks,1,"The real word at the minute boundary must remain once: {file}");
+            assert!(text.to_lowercase().contains("seguimos"),"Final words missing: {file}");
+            // Word timestamps at a spoken boundary can disagree even before tail
+            // preparation. The existing full-audio fallback must preserve the word;
+            // compare its frequency with the explicit baseline in the saved report.
+            assert_eq!(fs::read(root.join("audio.pcm")).unwrap(),pcm);
+            assert_eq!(tauri::async_runtime::block_on(finish(&root)).unwrap(),text);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "65-second paced synthetic PCM; real Groq, no microphone or personal recordings"]
+    fn synthetic_long_dictation_preserves_completed_chunks_and_final_tail() {
+        let fixture=PathBuf::from(std::env::var_os("WHISPERA_TIMING_FIXTURES").expect("Synthetic fixtures"));let reference:serde_json::Value=serde_json::from_slice(&fs::read(fixture.join("reference.json")).unwrap()).unwrap();assert_eq!(reference["syntheticOnly"],true);
+        let mut wave=hound::WavReader::open(fixture.join("synthetic-20s.wav")).unwrap();let rate=wave.spec().sample_rate;let base:Vec<i16>=wave.samples().map(Result::unwrap).collect();
+        let samples:Vec<i16>=base.iter().copied().cycle().take(rate as usize*65).collect();let pcm:Vec<u8>=samples.iter().flat_map(|sample|sample.to_le_bytes()).collect();
+        crate::lossless_upload::configure(Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows){"../node_modules/ffmpeg-static/ffmpeg.exe"}else{"../node_modules/ffmpeg-static/ffmpeg"}));
+        let root=std::env::temp_dir().join(format!("whispera-long-timing-{}",uuid::Uuid::new_v4()));fs::create_dir(&root).unwrap();fs::write(root.join("session.json"),serde_json::to_vec(&audio::Manifest{id:"synthetic".into(),sample_rate:rate,created_at:"synthetic".into()}).unwrap()).unwrap();fs::write(root.join("audio.pcm"),[]).unwrap();let mut settings=Settings::default();settings.language="es".into();prepare(&root,settings,vec![]).unwrap();
+        let stop=Arc::new(AtomicBool::new(false));let wake=Arc::new(tokio::sync::Notify::new());let dir=root.clone();let signal=stop.clone();let notification=wake.clone();
+        tauri::async_runtime::block_on(async {
+            let worker=tauri::async_runtime::spawn(async move {run_notified(dir,signal,notification).await});let dir=root.clone();let began=Instant::now();
+            let producer=std::thread::spawn(move ||{let mut file=fs::OpenOptions::new().append(true).open(dir.join("audio.pcm")).unwrap();for (i,block) in pcm.chunks(rate as usize/10*2).enumerate(){std::thread::sleep((began+Duration::from_millis((i as u64+1)*100)).saturating_duration_since(Instant::now()));file.write_all(block).unwrap();}file.sync_all().unwrap();Instant::now()});
+            let stopped=tauri::async_runtime::spawn_blocking(move ||producer.join().unwrap()).await.unwrap();stop.store(true,Ordering::SeqCst);wake.notify_one();let cached_before_finish=root.join("live-0000.json").exists();let _=worker.await.unwrap();let text=finish(&root).await.unwrap();let elapsed=stopped.elapsed().as_secs_f64()*1000.;
+            let lower=text.to_lowercase();assert!(lower.matches("carpeta").count()>=3,"Completed speech missing");assert!(lower.matches("prueba").count()>=4,"Final recorded speech missing");
+            assert!(!lower.contains("gracias"),"A closing word was invented over the synthetic silent tail");
+            assert!(cached_before_finish,"First minute must finish before stop in this paced fixture");
+            assert!(!root.join("full-audio-fallback.json").exists(),"Silent-tail preparation must not break the join");
+            let cached=Instant::now();assert_eq!(finish(&root).await.unwrap(),text);let report=serde_json::json!({"syntheticOnly":true,"seconds":65,"sampleRate":rate,"firstChunkCachedAtStop":cached_before_finish,"stopToTextMs":elapsed,"cachedRetryMs":cached.elapsed().as_secs_f64()*1000.,"fallback":root.join("full-audio-fallback.json").exists(),"text":text});fs::write(std::env::var_os("WHISPERA_LONG_RESULTS").expect("Results file"),serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        });fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "Real Groq, explicitly supplied synthetic audio only; includes stop, preparation and transcription"]
+    fn synthetic_short_dictation_stop_to_text() {
+        let fixture=PathBuf::from(std::env::var_os("WHISPERA_TIMING_FIXTURES").expect("Synthetic fixtures"));
+        let reference:serde_json::Value=serde_json::from_slice(&fs::read(fixture.join("reference.json")).unwrap()).unwrap();assert_eq!(reference["syntheticOnly"],true);
+        let mut wave=hound::WavReader::open(fixture.join("synthetic-20s.wav")).unwrap();let spec=wave.spec();let samples:Vec<i16>=wave.samples().map(Result::unwrap).collect();assert_eq!(samples.len() as f64/spec.sample_rate as f64,20.);
+        crate::lossless_upload::configure(Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows){"../node_modules/ffmpeg-static/ffmpeg.exe"}else{"../node_modules/ffmpeg-static/ffmpeg"}));
+        let output=PathBuf::from(std::env::var_os("WHISPERA_DICTATION_RESULTS").expect("Results file"));let mut rows=Vec::new();
+        for trial in 0..6 { for optimized in if trial%2==0 {[false,true]}else{[true,false]} {
+            crate::lossless_upload::BENCHMARK_BYPASS.store(!optimized,Ordering::SeqCst);
+            let root=std::env::temp_dir().join(format!("whispera-dictation-timing-{}",uuid::Uuid::new_v4()));fs::create_dir(&root).unwrap();
+            fs::write(root.join("session.json"),serde_json::to_vec(&audio::Manifest{id:"synthetic".into(),sample_rate:spec.sample_rate,created_at:"synthetic".into()}).unwrap()).unwrap();
+            fs::write(root.join("audio.pcm"),samples.iter().flat_map(|sample|sample.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+            let mut settings=Settings::default();settings.language="es".into();prepare(&root,settings,vec![]).unwrap();
+            let stop=Arc::new(AtomicBool::new(false));let wake=Arc::new(tokio::sync::Notify::new());let signal=stop.clone();let notification=wake.clone();let dir=root.clone();
+            let worker=tauri::async_runtime::spawn(async move{run_notified(dir,signal,notification).await});
+            std::thread::sleep(Duration::from_millis(20));let at=Instant::now();stop.store(true,Ordering::SeqCst);if optimized {wake.notify_one();}
+            let text=tauri::async_runtime::block_on(async {worker.await.unwrap().unwrap();finish(&root).await.unwrap()});
+            rows.push(serde_json::json!({"trial":trial,"warmup":trial==0,"optimized":optimized,"sampleRate":spec.sample_rate,"stopToTextMs":at.elapsed().as_secs_f64()*1000.,"text":text,"seconds":20.,"microphone":false,"pasteTested":false}));
+            fs::write(&output,serde_json::to_vec_pretty(&rows).unwrap()).unwrap();assert!(text.to_lowercase().contains("carpeta"));fs::remove_dir_all(root).unwrap();
+        }}
+        crate::lossless_upload::BENCHMARK_BYPASS.store(false,Ordering::SeqCst);
+    }
+    #[test]
+    fn stop_interrupts_idle_and_retry_waits_without_cancelling_audio_requests() {
+        tauri::async_runtime::block_on(async {
+            for delay in [Duration::from_millis(200),Duration::from_secs(4)] {
+                let stop=Arc::new(AtomicBool::new(false));let wake=Arc::new(tokio::sync::Notify::new());
+                let signal=stop.clone();let notification=wake.clone();
+                let task=tauri::async_runtime::spawn(async move {wait_or_stop(&signal,&notification,delay).await});
+                tokio::time::sleep(Duration::from_millis(10)).await;let at=Instant::now();stop.store(true,Ordering::SeqCst);wake.notify_one();
+                assert!(tokio::time::timeout(Duration::from_secs(1),task).await.unwrap().unwrap());assert!(at.elapsed()<Duration::from_secs(1));
+            }
+            let stop=AtomicBool::new(true);assert!(wait_or_stop(&stop,&tokio::sync::Notify::new(),Duration::from_secs(4)).await);
+        });
+    }
     #[test]
     fn ambiguous_boundaries_fall_back_without_guessing_repeated_words() {
         let mut left = Cached {
@@ -509,7 +661,8 @@ mod tests {
             w,
             1000,
             &p,
-            &AtomicBool::new(false)
+            &AtomicBool::new(false),
+            &tokio::sync::Notify::new()
         ))
         .is_err());
         fs::remove_dir_all(dir).unwrap();
@@ -589,7 +742,7 @@ mod tests {
                 let began = Instant::now();
                 let mut texts = vec![];
                 for path in audio::materialize(&baseline, 16_000_000).unwrap() {
-                    let path = audio::trimmed_copy(&path).unwrap();
+                    let path = audio::trimmed_copy(&path).unwrap().unwrap();
                     texts.push(groq::transcribe_raw(&path, &settings, &[]).await.unwrap());
                 }
                 let ms = began.elapsed().as_secs_f64() * 1000.;
@@ -658,7 +811,7 @@ mod tests {
             let mut texts = vec![];
             for path in audio::materialize(&baseline, 16_000_000).unwrap() {
                 texts.push(
-                    groq::transcribe_raw(&audio::trimmed_copy(&path).unwrap(), &settings, &[])
+                    groq::transcribe_raw(&audio::trimmed_copy(&path).unwrap().unwrap(), &settings, &[])
                         .await
                         .unwrap(),
                 );
